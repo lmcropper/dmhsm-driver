@@ -1,0 +1,459 @@
+#include <Arduino.h>
+#include "driver/spi_master.h"
+#include "esp_err.h"
+#include "esp_heap_caps.h"
+#include <strings.h>
+
+/*
+ * Connections based on the DMHSM0012VGNA datasheet and ESP32 VSPI/SPI3.
+ *
+ * Display Pin  | Display Signal | ESP32 Pin | ESP32 Signal | Purpose
+ * -------------|----------------|-----------|--------------|------------------------------
+ * 13           | SPI_SCK/SCLK   | GPIO18    | SCLK         | Clock
+ * 10           | IO0 / SDA0     | GPIO23    | DATA0/MOSI   | Register write + QSPI data 0
+ * 8            | IO1 / SDA1     | GPIO19    | DATA1/MISO   | Register read + QSPI data 1
+ * 14           | IO2 / SDA2     | GPIO22    | DATA2/WP     | QSPI data 2
+ * 12           | IO3 / SDA3     | GPIO21    | DATA3/HD     | QSPI data 3
+ * 11           | CS             | GPIO5     | CS           | Chip select
+ *
+ * GPIO21/GPIO22 are ordinary GPIO-matrix pins on ESP32-WROOM modules. Other
+ * output-capable GPIOs can work for DATA2/DATA3, but avoid GPIO6-GPIO11 because
+ * they are connected to the module's flash.
+ */
+
+#define PIN_NUM_DATA0 23
+#define PIN_NUM_DATA1 19
+#define PIN_NUM_DATA2 22
+#define PIN_NUM_DATA3 21
+#define PIN_NUM_CLK   18
+#define PIN_NUM_CS     5
+#define PIN_NUM_RST   17
+
+#define CMD_WRITE_REG 0x78
+#define CMD_READ_REG  0x79
+#define CMD_SPI_DATA  0x02
+#define CMD_QSPI_DATA 0x32
+
+#define DISPLAY_WRITE         0x2C
+#define DISPLAY_PARTIAL_WRITE 0x3C
+#define DISPLAY_ROW_ADDRESS   0x2A
+
+#define DISPLAY_WIDTH 640
+#define DISPLAY_HEIGHT 480
+
+#define PANEL_SPI_HOST VSPI_HOST
+#define SPI_FREQUENCY SPI_MASTER_FREQ_20M
+
+static const uint8_t DISPLAY_FORMAT_GRAY256 = 0x9A;
+static spi_device_handle_t displaySpi = nullptr;
+static uint8_t *rowBuffer = nullptr;
+
+enum DisplayTransferMode {
+  DISPLAY_MODE_SPI,
+  DISPLAY_MODE_QSPI,
+};
+
+static DisplayTransferMode displayMode = DISPLAY_MODE_QSPI;
+
+// The serial protocol is intentionally line-oriented so gui.py can wait for a
+// single response per command:
+//   R <reg_hex>                  -> <value_hex> or ERR ...
+//   W <reg_hex> <value_hex>      -> OK or ERR ...
+//   X                            -> OK
+//   M [SPI|QSPI]                 -> SPI/QSPI when queried, OK when set
+//   S <x> <y> <size> [intensity] [SPI|QSPI] -> OK or ERR ...
+//   B [block_size] [SPI|QSPI]    -> OK or ERR ...
+void printEspError(const char *operation, esp_err_t err) {
+  if (err != ESP_OK) {
+    Serial.printf("ERR %s: %s\n", operation, esp_err_to_name(err));
+  }
+}
+
+const char *displayModeName(DisplayTransferMode mode) {
+  return mode == DISPLAY_MODE_QSPI ? "QSPI" : "SPI";
+}
+
+bool parseDisplayModeToken(const char *token, DisplayTransferMode *mode) {
+  if (strcasecmp(token, "QSPI") == 0 || strcasecmp(token, "Q") == 0 || strcmp(token, "4") == 0) {
+    *mode = DISPLAY_MODE_QSPI;
+    return true;
+  }
+
+  if (strcasecmp(token, "SPI") == 0 || strcasecmp(token, "S") == 0 || strcmp(token, "1") == 0) {
+    *mode = DISPLAY_MODE_SPI;
+    return true;
+  }
+
+  return false;
+}
+
+bool parseUnsignedToken(const char *token, unsigned int *value) {
+  char *end = nullptr;
+  unsigned long parsed = strtoul(token, &end, 0);
+  if (end == token || *end != '\0') {
+    return false;
+  }
+
+  *value = static_cast<unsigned int>(parsed);
+  return true;
+}
+
+esp_err_t transferPanel(uint8_t command,
+                        uint32_t address,
+                        uint8_t addressBits,
+                        const void *txBuffer,
+                        size_t txBytes,
+                        void *rxBuffer,
+                        size_t rxBits,
+                        uint32_t flags) {
+  spi_transaction_ext_t trans = {};
+  trans.base.flags = flags | SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR;
+  trans.command_bits = 8;
+  trans.address_bits = addressBits;
+  trans.base.cmd = command;
+  trans.base.addr = address;
+  trans.base.length = txBytes * 8;
+  trans.base.tx_buffer = txBuffer;
+  trans.base.rxlength = rxBits;
+  trans.base.rx_buffer = rxBuffer;
+
+  return spi_device_polling_transmit(displaySpi, reinterpret_cast<spi_transaction_t *>(&trans));
+}
+
+esp_err_t transferDataChunk(const void *txBuffer, size_t txBytes, DisplayTransferMode mode) {
+  spi_transaction_ext_t trans = {};
+  trans.base.flags = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR;
+  if (mode == DISPLAY_MODE_QSPI) {
+    trans.base.flags |= SPI_TRANS_MODE_QIO;
+  }
+  trans.command_bits = 0;
+  trans.address_bits = 0;
+  trans.base.length = txBytes * 8;
+  trans.base.tx_buffer = txBuffer;
+
+  return spi_device_polling_transmit(displaySpi, reinterpret_cast<spi_transaction_t *>(&trans));
+}
+
+esp_err_t beginDisplayData(uint8_t displayCommand, const void *txBuffer, size_t txBytes, DisplayTransferMode mode) {
+  const uint8_t busCommand = mode == DISPLAY_MODE_QSPI ? CMD_QSPI_DATA : CMD_SPI_DATA;
+  const uint32_t address = static_cast<uint32_t>(displayCommand) << 8;
+  const uint32_t flags = mode == DISPLAY_MODE_QSPI ? SPI_TRANS_MODE_QIO : 0;
+
+  return transferPanel(busCommand, address, 24, txBuffer, txBytes, nullptr, 0, flags);
+}
+
+bool initDisplaySpi() {
+  spi_bus_config_t busConfig = {};
+  busConfig.mosi_io_num = PIN_NUM_DATA0;
+  busConfig.miso_io_num = PIN_NUM_DATA1;
+  busConfig.sclk_io_num = PIN_NUM_CLK;
+  busConfig.quadwp_io_num = PIN_NUM_DATA2;
+  busConfig.quadhd_io_num = PIN_NUM_DATA3;
+  busConfig.max_transfer_sz = DISPLAY_WIDTH;
+  busConfig.flags = SPICOMMON_BUSFLAG_MASTER | SPICOMMON_BUSFLAG_QUAD;
+
+  esp_err_t err = spi_bus_initialize(PANEL_SPI_HOST, &busConfig, SPI_DMA_CH_AUTO);
+  if (err != ESP_OK) {
+    printEspError("spi_bus_initialize", err);
+    return false;
+  }
+
+  spi_device_interface_config_t deviceConfig = {};
+  deviceConfig.mode = 0;
+  deviceConfig.clock_speed_hz = SPI_FREQUENCY;
+  deviceConfig.spics_io_num = -1;
+  deviceConfig.flags = SPI_DEVICE_HALFDUPLEX;
+  deviceConfig.queue_size = 1;
+
+  err = spi_bus_add_device(PANEL_SPI_HOST, &deviceConfig, &displaySpi);
+  if (err != ESP_OK) {
+    printEspError("spi_bus_add_device", err);
+    return false;
+  }
+
+  rowBuffer = static_cast<uint8_t *>(heap_caps_malloc(DISPLAY_WIDTH, MALLOC_CAP_DMA));
+  if (rowBuffer == nullptr) {
+    Serial.println("ERR row buffer allocation failed");
+    return false;
+  }
+
+  return true;
+}
+
+esp_err_t writeRegister(uint8_t reg_addr, uint8_t value) {
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = transferPanel(CMD_WRITE_REG, (reg_addr << 8) | value, 16, nullptr, 0, nullptr, 0, 0);
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+esp_err_t readRegister(uint8_t reg_addr, uint8_t *result) {
+  spi_transaction_ext_t trans = {};
+  trans.base.flags = SPI_TRANS_VARIABLE_CMD | SPI_TRANS_VARIABLE_ADDR | SPI_TRANS_USE_RXDATA;
+  trans.command_bits = 8;
+  trans.address_bits = 8;
+  trans.base.cmd = CMD_READ_REG;
+  trans.base.addr = reg_addr;
+  trans.base.rxlength = 8;
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = spi_device_polling_transmit(displaySpi, reinterpret_cast<spi_transaction_t *>(&trans));
+  digitalWrite(PIN_NUM_CS, HIGH);
+
+  if (err == ESP_OK) {
+    *result = trans.base.rx_data[0];
+  }
+  return err;
+}
+
+esp_err_t ensureGray256Mode() {
+  esp_err_t err = writeRegister(0x00, DISPLAY_FORMAT_GRAY256);
+  if (err != ESP_OK) return err;
+  err = writeRegister(0x04, 0x00);
+  if (err != ESP_OK) return err;
+  return writeRegister(0x1B, 0x00);
+}
+
+esp_err_t writeRowAddressWindow(uint16_t row_start, uint16_t row_end) {
+  uint8_t addressBytes[4] = {
+    static_cast<uint8_t>((row_start >> 8) & 0xFF),
+    static_cast<uint8_t>(row_start & 0xFF),
+    static_cast<uint8_t>((row_end >> 8) & 0xFF),
+    static_cast<uint8_t>(row_end & 0xFF),
+  };
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = beginDisplayData(DISPLAY_ROW_ADDRESS, addressBytes, sizeof(addressBytes), DISPLAY_MODE_SPI);
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+esp_err_t writeCheckerboardFrame(uint16_t blockSize, uint8_t highIntensity, uint8_t lowIntensity, DisplayTransferMode mode) {
+  if (blockSize == 0) {
+    blockSize = 4;
+  }
+
+  if (rowBuffer == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t row = 0; row < DISPLAY_HEIGHT; ++row) {
+    for (uint16_t col = 0; col < DISPLAY_WIDTH; ++col) {
+      const bool highBlock = ((((col / blockSize) + (row / blockSize)) & 0x01) == 0);
+      rowBuffer[col] = highBlock ? highIntensity : lowIntensity;
+    }
+
+    // The display-data header changes with the transfer mode:
+    //   SPI  mode: 0x02 + 0x002C00, then one data bit lane
+    //   QSPI mode: 0x32 + 0x002C00, then four data bit lanes
+    // Subsequent chunks keep CS low and send only more pixel bytes.
+    if (row == 0) {
+      err = beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, mode);
+    } else {
+      err = transferDataChunk(rowBuffer, DISPLAY_WIDTH, mode);
+    }
+
+    if (err != ESP_OK) {
+      break;
+    }
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+esp_err_t writeSquarePixels(uint16_t x, uint16_t y, uint16_t size, uint8_t intensity, DisplayTransferMode mode) {
+  if (size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (rowBuffer == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  uint16_t width = size;
+  uint16_t height = size;
+  if (x + width > DISPLAY_WIDTH) {
+    width = DISPLAY_WIDTH - x;
+  }
+  if (y + height > DISPLAY_HEIGHT) {
+    height = DISPLAY_HEIGHT - y;
+  }
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t row = 0; row < DISPLAY_HEIGHT; ++row) {
+    for (uint16_t col = 0; col < DISPLAY_WIDTH; ++col) {
+      uint8_t pixel = 0x00;
+      if (row >= y && row < (y + height) && col >= x && col < (x + width)) {
+        pixel = intensity;
+      }
+      rowBuffer[col] = pixel;
+    }
+
+    if (row == 0) {
+      err = beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, mode);
+    } else {
+      err = transferDataChunk(rowBuffer, DISPLAY_WIDTH, mode);
+    }
+
+    if (err != ESP_OK) {
+      break;
+    }
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(PIN_NUM_CS, OUTPUT);
+  digitalWrite(PIN_NUM_CS, HIGH);
+  pinMode(PIN_NUM_RST, OUTPUT);
+  digitalWrite(PIN_NUM_RST, HIGH);
+
+  if (!initDisplaySpi()) {
+    Serial.println("SPI INIT FAILED");
+    while (true) {
+      delay(1000);
+    }
+  }
+
+  Serial.println("READY");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+    if (input.length() == 0) return;
+
+    char cmd = input.charAt(0);
+    if (cmd == 'X' || cmd == 'x') {
+      digitalWrite(PIN_NUM_RST, LOW);
+      delay(5);
+      digitalWrite(PIN_NUM_RST, HIGH);
+      Serial.println("OK");
+    } else if (cmd == 'R' || cmd == 'r') {
+      int reg;
+      if (sscanf(input.c_str() + 1, "%x", &reg) == 1) {
+        uint8_t result = 0;
+        esp_err_t err = readRegister(static_cast<uint8_t>(reg), &result);
+        if (err == ESP_OK) {
+          Serial.printf("%02X\n", result);
+        } else {
+          printEspError("readRegister", err);
+        }
+      } else {
+        Serial.println("ERR");
+      }
+    } else if (cmd == 'W' || cmd == 'w') {
+      int reg, val;
+      if (sscanf(input.c_str() + 1, "%x %x", &reg, &val) == 2) {
+        esp_err_t err = writeRegister(static_cast<uint8_t>(reg), static_cast<uint8_t>(val));
+        if (err == ESP_OK) {
+          Serial.println("OK");
+        } else {
+          printEspError("writeRegister", err);
+        }
+      } else {
+        Serial.println("ERR");
+      }
+    } else if (cmd == 'M' || cmd == 'm') {
+      char modeToken[16] = {};
+      int parsed = sscanf(input.c_str() + 1, "%15s", modeToken);
+      if (parsed == 0) {
+        Serial.println(displayModeName(displayMode));
+      } else if (parseDisplayModeToken(modeToken, &displayMode)) {
+        Serial.println("OK");
+      } else {
+        Serial.println("ERR");
+      }
+    } else if (cmd == 'S' || cmd == 's') {
+      unsigned int x, y, size, intensity = 0xFF;
+      char arg4[16] = {};
+      char arg5[16] = {};
+      DisplayTransferMode requestedMode = displayMode;
+      int parsed = sscanf(input.c_str() + 1, "%u %u %u %15s %15s", &x, &y, &size, arg4, arg5);
+      if (parsed >= 3) {
+        bool argsOk = true;
+        if (parsed >= 4) {
+          if (parseDisplayModeToken(arg4, &requestedMode)) {
+            // Intensity omitted; arg4 selected the transfer mode.
+          } else {
+            argsOk = parseUnsignedToken(arg4, &intensity);
+            argsOk = argsOk && intensity <= 0xFF;
+          }
+        }
+        if (parsed >= 5) {
+          argsOk = argsOk && parseDisplayModeToken(arg5, &requestedMode);
+        }
+
+        if (argsOk) {
+          esp_err_t err = ensureGray256Mode();
+          if (err == ESP_OK) {
+            err = writeSquarePixels(static_cast<uint16_t>(x), static_cast<uint16_t>(y), static_cast<uint16_t>(size), static_cast<uint8_t>(intensity), requestedMode);
+          }
+
+          if (err == ESP_OK) {
+            displayMode = requestedMode;
+            Serial.println("OK");
+          } else {
+            printEspError("writeSquarePixels", err);
+          }
+        } else {
+          Serial.println("ERR");
+        }
+      } else {
+        Serial.println("ERR");
+      }
+    } else if (cmd == 'B' || cmd == 'b') {
+      unsigned int blockSize = 4;
+      char arg1[16] = {};
+      char arg2[16] = {};
+      DisplayTransferMode requestedMode = displayMode;
+      int parsed = sscanf(input.c_str() + 1, "%15s %15s", arg1, arg2);
+      bool argsOk = true;
+
+      if (parsed >= 1) {
+        if (parseDisplayModeToken(arg1, &requestedMode)) {
+          // Block size omitted; arg1 selected the transfer mode.
+        } else {
+          argsOk = parseUnsignedToken(arg1, &blockSize);
+          argsOk = argsOk && blockSize > 0;
+        }
+      }
+      if (parsed >= 2) {
+        argsOk = argsOk && parseDisplayModeToken(arg2, &requestedMode);
+      }
+
+      if (argsOk) {
+        esp_err_t err = ensureGray256Mode();
+        if (err == ESP_OK) {
+          err = writeCheckerboardFrame(static_cast<uint16_t>(blockSize), 0xFF, 0x00, requestedMode);
+        }
+
+        if (err == ESP_OK) {
+          displayMode = requestedMode;
+          Serial.println("OK");
+        } else {
+          printEspError("writeCheckerboardFrame", err);
+        }
+      } else {
+        Serial.println("ERR");
+      }
+    } else {
+      Serial.println("ERR");
+    }
+  }
+}
