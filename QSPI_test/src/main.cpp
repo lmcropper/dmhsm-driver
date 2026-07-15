@@ -42,7 +42,7 @@
 #define DISPLAY_HEIGHT 480
 
 #define PANEL_SPI_HOST VSPI_HOST
-#define SPI_FREQUENCY SPI_MASTER_FREQ_20M
+#define SPI_FREQUENCY 1e6
 
 static const uint8_t DISPLAY_FORMAT_GRAY256 = 0x9A;
 static spi_device_handle_t displaySpi = nullptr;
@@ -62,7 +62,7 @@ static DisplayTransferMode displayMode = DISPLAY_MODE_QSPI;
 //   X                            -> OK
 //   M [SPI|QSPI]                 -> SPI/QSPI when queried, OK when set
 //   S <x> <y> <size> [intensity] [SPI|QSPI] -> OK or ERR ...
-//   B [block_size] [SPI|QSPI]    -> OK or ERR ...
+//   B [block_size] [brightness] [SPI|QSPI] -> OK or ERR ...
 void printEspError(const char *operation, esp_err_t err) {
   if (err != ESP_OK) {
     Serial.printf("ERR %s: %s\n", operation, esp_err_to_name(err));
@@ -419,10 +419,12 @@ void loop() {
       }
     } else if (cmd == 'B' || cmd == 'b') {
       unsigned int blockSize = 4;
+      unsigned int brightness = 0xFF;
       char arg1[16] = {};
       char arg2[16] = {};
+      char arg3[16] = {};
       DisplayTransferMode requestedMode = displayMode;
-      int parsed = sscanf(input.c_str() + 1, "%15s %15s", arg1, arg2);
+      int parsed = sscanf(input.c_str() + 1, "%15s %15s %15s", arg1, arg2, arg3);
       bool argsOk = true;
 
       if (parsed >= 1) {
@@ -434,13 +436,21 @@ void loop() {
         }
       }
       if (parsed >= 2) {
-        argsOk = argsOk && parseDisplayModeToken(arg2, &requestedMode);
+        if (parseDisplayModeToken(arg2, &requestedMode)) {
+          // Brightness omitted; arg2 selected the transfer mode.
+        } else {
+          argsOk = argsOk && parseUnsignedToken(arg2, &brightness);
+          argsOk = argsOk && brightness <= 0xFF;
+        }
+      }
+      if (parsed >= 3) {
+        argsOk = argsOk && parseDisplayModeToken(arg3, &requestedMode);
       }
 
       if (argsOk) {
         esp_err_t err = ensureGray256Mode();
         if (err == ESP_OK) {
-          err = writeCheckerboardFrame(static_cast<uint16_t>(blockSize), 0xFF, 0x00, requestedMode);
+          err = writeCheckerboardFrame(static_cast<uint16_t>(blockSize), static_cast<uint8_t>(brightness), 0x00, requestedMode);
         }
 
         if (err == ESP_OK) {

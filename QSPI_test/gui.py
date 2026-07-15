@@ -134,13 +134,19 @@ class SPIControllerApp:
         self.square_intensity_entry = self.add_grid_entry(pixel_frame, "Intensity:", "0xFF", 0, 6, width=10)
         ttk.Button(pixel_frame, text="Draw Square", command=self.draw_square).grid(row=0, column=8, padx=5, pady=5)
 
-        checker_frame = ttk.LabelFrame(self.root, text="Display Checkerboard Frame")
+        checker_frame = ttk.LabelFrame(self.root, text="Display Grid / Checkerboard Frame")
         checker_frame.pack(padx=10, pady=5, fill="x")
 
         ttk.Label(checker_frame, text="Block size px:").pack(side="left", padx=5, pady=5)
         self.checker_size_entry = ttk.Entry(checker_frame, width=8)
         self.checker_size_entry.pack(side="left", padx=5, pady=5)
         self.checker_size_entry.insert(0, "4")
+
+        ttk.Label(checker_frame, text="Brightness:").pack(side="left", padx=5, pady=5)
+        self.checker_brightness_entry = ttk.Entry(checker_frame, width=10)
+        self.checker_brightness_entry.pack(side="left", padx=5, pady=5)
+        self.checker_brightness_entry.insert(0, "0xFF")
+
         ttk.Button(checker_frame, text="Send Full-Screen Checkerboard", command=self.send_checkerboard).pack(side="left", padx=5, pady=5)
 
         log_frame = ttk.LabelFrame(self.root, text="Console Output")
@@ -418,10 +424,14 @@ class SPIControllerApp:
     def send_checkerboard(self):
         def task():
             block_size = self.parse_pixel(self.checker_size_entry.get(), "block size", 1, DISPLAY_WIDTH)
+            brightness = self.parse_byte(self.checker_brightness_entry.get(), "grid brightness")
             mode = self.selected_transfer_mode()
-            response = self.send_cmd_with_timeout(f"B {block_size} {mode}", FRAME_TIMEOUT_SECONDS)
+            response = self.send_cmd_with_timeout(f"B {block_size} {brightness} {mode}", FRAME_TIMEOUT_SECONDS)
             self.expect_ok(response, "checkerboard frame")
-            self.log_from_thread(f"Full-screen {mode} checkerboard sent with block size {block_size} px")
+            self.log_from_thread(
+                f"Full-screen {mode} checkerboard sent with block size {block_size} px "
+                f"and brightness 0x{brightness:02X}"
+            )
 
         self.run_serial_task("Sending checkerboard", task)
 
