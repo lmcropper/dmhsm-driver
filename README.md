@@ -37,6 +37,7 @@ A CHECKER  <fps> <block-size> <intensity> <speed>
 A BARS     <fps> <bar-width>  <intensity> <speed>
 A GRADIENT <fps> <size>       <intensity> <speed>
 A SQUARE   <fps> <side-length> <intensity> <speed>
+A JAY      <fps> <letter-height> <intensity> <speed>
 A STOP
 A
 ```

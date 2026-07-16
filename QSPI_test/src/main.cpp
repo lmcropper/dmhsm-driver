@@ -61,13 +61,14 @@ enum AnimationType {
   ANIMATION_BARS,
   ANIMATION_GRADIENT,
   ANIMATION_SQUARE,
+  ANIMATION_JAY,
 };
 
 struct AnimationState {
   AnimationType type = ANIMATION_STOPPED;
   uint16_t fps = 10;
   uint16_t size = 32;
-  uint8_t intensity = 0xFF;
+  uint8_t intensity = 1;
   int16_t speed = 4;
   uint32_t frame = 0;
   uint32_t nextFrameAt = 0;
@@ -340,6 +341,7 @@ const char *animationTypeName(AnimationType type) {
     case ANIMATION_BARS: return "BARS";
     case ANIMATION_GRADIENT: return "GRADIENT";
     case ANIMATION_SQUARE: return "SQUARE";
+    case ANIMATION_JAY: return "JAY";
     default: return "STOPPED";
   }
 }
@@ -370,7 +372,7 @@ esp_err_t writeAnimationFrame() {
           break;
         }
         case ANIMATION_GRADIENT:
-          pixel = static_cast<uint8_t>((x + y + phase) & 0xFF);
+          pixel = static_cast<uint8_t>((static_cast<uint16_t>((x + y + phase) & 0xFF) * animation.intensity) / 255);
           break;
         case ANIMATION_SQUARE: {
           const uint16_t side = animation.size < DISPLAY_HEIGHT ? animation.size : DISPLAY_HEIGHT;
@@ -381,6 +383,28 @@ esp_err_t writeAnimationFrame() {
           const uint16_t top = (DISPLAY_HEIGHT - side) / 2;
           pixel = (x >= left && x < left + side && y >= top && y < top + side)
                     ? animation.intensity : 0;
+          break;
+        }
+        case ANIMATION_JAY: {
+          static const char *glyphs[] = {
+            "11111" "00100" "00100" "00100" "10100" "10100" "01100",
+            "01110" "10001" "10001" "11111" "10001" "10001" "10001",
+            "10001" "10001" "01010" "00100" "00100" "00100" "00100",
+          };
+          const uint16_t scale = animation.size / 7 > 0 ? animation.size / 7 : 1;
+          const uint16_t wordWidth = 17 * scale;
+          const uint16_t wordHeight = 7 * scale;
+          const int32_t travel = DISPLAY_WIDTH > wordWidth ? DISPLAY_WIDTH - wordWidth : 1;
+          int32_t left = phase % (2 * travel);
+          if (left < 0) left += 2 * travel;
+          if (left > travel) left = 2 * travel - left;
+          const int32_t localX = static_cast<int32_t>(x) - left;
+          const int32_t localY = static_cast<int32_t>(y) - (DISPLAY_HEIGHT - wordHeight) / 2;
+          const int32_t letter = localX >= 0 ? localX / (6 * scale) : -1;
+          const int32_t column = localX >= 0 ? (localX % (6 * scale)) / scale : -1;
+          const int32_t row = localY >= 0 ? localY / scale : -1;
+          pixel = letter >= 0 && letter < 3 && column >= 0 && column < 5 && row >= 0 && row < 7 &&
+                  glyphs[letter][row * 5 + column] == '1' ? animation.intensity : 0;
           break;
         }
         default:
@@ -451,7 +475,7 @@ void loop() {
     char cmd = input.charAt(0);
     if (cmd == 'A' || cmd == 'a') {
       char typeToken[16] = {};
-      unsigned int fps = 10, size = 32, intensity = 255;
+      unsigned int fps = 10, size = 32, intensity = 1;
       int speed = 4;
       int parsed = sscanf(input.c_str() + 1, "%15s %u %u %u %d", typeToken, &fps, &size, &intensity, &speed);
 
@@ -468,6 +492,7 @@ void loop() {
         else if (strcasecmp(typeToken, "BARS") == 0) requested = ANIMATION_BARS;
         else if (strcasecmp(typeToken, "GRADIENT") == 0) requested = ANIMATION_GRADIENT;
         else if (strcasecmp(typeToken, "SQUARE") == 0) requested = ANIMATION_SQUARE;
+        else if (strcasecmp(typeToken, "JAY") == 0) requested = ANIMATION_JAY;
 
         if (requested == ANIMATION_STOPPED || fps < 1 || fps > 120 || size < 1 ||
             size > DISPLAY_WIDTH || intensity > 255) {

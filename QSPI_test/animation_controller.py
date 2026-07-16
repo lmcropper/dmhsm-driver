@@ -38,10 +38,11 @@ class AnimationController:
 
         self.port_var = tk.StringVar()
         self.animation_var = tk.StringVar(value="CHECKER")
-        self.fps_var = tk.IntVar(value=10)
-        self.size_var = tk.IntVar(value=32)
-        self.intensity_var = tk.IntVar(value=255)
-        self.speed_var = tk.IntVar(value=4)
+        self.fps_var = tk.StringVar(value="10")
+        self.size_var = tk.StringVar(value="32")
+        self.intensity_var = tk.StringVar(value="1")
+        self.speed_var = tk.StringVar(value="4")
+        self.committed = {"fps": 10, "size": 32, "intensity": 1, "speed": 4}
         self.status_var = tk.StringVar(value="Preview ready; hardware disconnected")
 
         self.build_ui()
@@ -63,14 +64,20 @@ class AnimationController:
         self.add_field(controls, 4, "Animation", ttk.Combobox(
             controls,
             textvariable=self.animation_var,
-            values=("CHECKER", "BARS", "GRADIENT", "SQUARE"),
+            values=("CHECKER", "BARS", "GRADIENT", "SQUARE", "JAY"),
             width=12,
             state="readonly",
         ))
-        self.add_field(controls, 5, "FPS", ttk.Spinbox(controls, from_=1, to=120, textvariable=self.fps_var, width=10))
-        self.add_field(controls, 6, "Size", ttk.Spinbox(controls, from_=1, to=640, textvariable=self.size_var, width=10))
-        self.add_field(controls, 7, "Intensity", ttk.Spinbox(controls, from_=0, to=255, textvariable=self.intensity_var, width=10))
-        self.add_field(controls, 8, "Speed", ttk.Spinbox(controls, from_=-100, to=100, textvariable=self.speed_var, width=10))
+        fields = (
+            (5, "FPS", "fps", self.fps_var, 1, 120),
+            (6, "Size", "size", self.size_var, 1, 640),
+            (7, "Brightness", "intensity", self.intensity_var, 0, 255),
+            (8, "Speed", "speed", self.speed_var, -100, 100),
+        )
+        for row, label, name, variable, low, high in fields:
+            widget = ttk.Spinbox(controls, from_=low, to=high, textvariable=variable, width=10)
+            widget.bind("<Return>", lambda _event, n=name: self.commit_field(n))
+            self.add_field(controls, row, label, widget)
 
         ttk.Button(controls, text="Play", command=self.play).grid(row=9, column=0, sticky="ew", pady=(12, 0))
         ttk.Button(controls, text="Stop", command=self.stop).grid(row=9, column=1, sticky="ew", pady=(12, 0))
@@ -118,13 +125,36 @@ class AnimationController:
             self.status_var.set(f"Connection failed: {exc}")
 
     def settings(self):
-        fps = max(1, min(120, self.fps_var.get()))
-        size = max(1, min(PANEL_WIDTH, self.size_var.get()))
-        intensity = max(0, min(255, self.intensity_var.get()))
-        speed = max(-100, min(100, self.speed_var.get()))
-        return self.animation_var.get(), fps, size, intensity, speed
+        return (self.animation_var.get(), self.committed["fps"], self.committed["size"],
+                self.committed["intensity"], self.committed["speed"])
+
+    def commit_field(self, name, apply_running=True):
+        variable = getattr(self, f"{name}_var") if name != "intensity" else self.intensity_var
+        limits = {"fps": (1, 120), "size": (1, PANEL_WIDTH),
+                  "intensity": (0, 255), "speed": (-100, 100)}
+        try:
+            value = int(variable.get())
+        except ValueError:
+            variable.set(str(self.committed[name]))
+            self.status_var.set(f"Invalid {name}; restored {self.committed[name]}")
+            return "break"
+        low, high = limits[name]
+        value = max(low, min(high, value))
+        variable.set(str(value))
+        self.committed[name] = value
+        if self.running and apply_running:
+            self.frame = 0
+            self.started_at = time.monotonic()
+            animation, fps, size, intensity, speed = self.settings()
+            self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed}")
+        return "break"
+
+    def commit_all_fields(self):
+        for name in self.committed:
+            self.commit_field(name, apply_running=False)
 
     def play(self):
+        self.commit_all_fields()
         animation, fps, size, intensity, speed = self.settings()
         self.running = True
         self.frame = 0
@@ -210,9 +240,32 @@ class AnimationController:
                 elif animation == "BARS":
                     value = intensity if (x + phase) % (2 * size) < size else 0
                 elif animation == "GRADIENT":
-                    value = (x + y + phase) & 0xFF
-                else:
+                    value = (((x + y + phase) & 0xFF) * intensity) // 255
+                elif animation == "SQUARE":
                     value = intensity if left <= x < left + side and top <= y < top + side else 0
+                else:
+                    scale = max(1, size // 7)
+                    word_width = 17 * scale
+                    word_height = 7 * scale
+                    jay_travel = max(1, PANEL_WIDTH - word_width)
+                    jay_left = phase % (2 * jay_travel)
+                    if jay_left > jay_travel:
+                        jay_left = 2 * jay_travel - jay_left
+                    local_x = x - jay_left
+                    local_y = y - (PANEL_HEIGHT - word_height) // 2
+                    letter = local_x // (6 * scale) if local_x >= 0 else -1
+                    column = (local_x % (6 * scale)) // scale if local_x >= 0 else -1
+                    row = local_y // scale if local_y >= 0 else -1
+                    if 0 <= letter < 3 and column < 5 and 0 <= row < 7:
+                        # Packed row-major 5x7 glyphs are clearer expressed as strings below.
+                        glyphs = (
+                            "11111" "00100" "00100" "00100" "10100" "10100" "01100",
+                            "01110" "10001" "10001" "11111" "10001" "10001" "10001",
+                            "10001" "10001" "01010" "00100" "00100" "00100" "00100",
+                        )
+                        value = intensity if glyphs[letter][row * 5 + column] == "1" else 0
+                    else:
+                        value = 0
                 output[index] = value
                 index += 1
         return bytes(output)
