@@ -14,3 +14,33 @@ This repository contains an ESP32 control driver for the **DMHSM0012VGNA** micro
 - `include/DMHSM.h`: C++ Class definition describing SPI constants and display interface bindings.
 - `src/DMHSM.cpp`: Class implementation of all initializations, resets, and pixel buffer transfers.
 - `src/main.cpp`: An example script invoking module instantiation through Arduino standard loop/setup models.
+
+## Interactive animation prototype
+
+`QSPI_test` now contains a first-pass on-device animation engine and a desktop
+preview/controller. The ESP32 renders frames locally, so serial carries only
+small control messages instead of 307,200 bytes per grayscale frame.
+
+Run the desktop controller with:
+
+```sh
+cd QSPI_test
+python3 animation_controller.py
+```
+
+The preview works without connecting hardware. After flashing
+`QSPI_test/src/main.cpp`, choose the ESP32 serial port and click **Connect** to
+mirror Play/Stop commands to the panel. Supported commands are:
+
+```text
+A CHECKER  <fps> <block-size> <intensity> <speed>
+A BARS     <fps> <bar-width>  <intensity> <speed>
+A GRADIENT <fps> <size>       <intensity> <speed>
+A SQUARE   <fps> <side-length> <intensity> <speed>
+A STOP
+A
+```
+
+The final `A` form returns the current animation settings and rendered frame
+counter. The panel QSPI clock is initially raised from 1 MHz to 10 MHz; verify
+signal integrity on the target hardware before trying higher rates.

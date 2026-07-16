@@ -42,7 +42,7 @@
 #define DISPLAY_HEIGHT 480
 
 #define PANEL_SPI_HOST VSPI_HOST
-#define SPI_FREQUENCY 1e6
+#define SPI_FREQUENCY 10e6
 
 static const uint8_t DISPLAY_FORMAT_GRAY256 = 0x9A;
 static spi_device_handle_t displaySpi = nullptr;
@@ -54,6 +54,26 @@ enum DisplayTransferMode {
 };
 
 static DisplayTransferMode displayMode = DISPLAY_MODE_QSPI;
+
+enum AnimationType {
+  ANIMATION_STOPPED,
+  ANIMATION_CHECKER,
+  ANIMATION_BARS,
+  ANIMATION_GRADIENT,
+  ANIMATION_SQUARE,
+};
+
+struct AnimationState {
+  AnimationType type = ANIMATION_STOPPED;
+  uint16_t fps = 10;
+  uint16_t size = 32;
+  uint8_t intensity = 0xFF;
+  int16_t speed = 4;
+  uint32_t frame = 0;
+  uint32_t nextFrameAt = 0;
+};
+
+static AnimationState animation;
 
 // The serial protocol is intentionally line-oriented so gui.py can wait for a
 // single response per command:
@@ -314,6 +334,95 @@ esp_err_t writeSquarePixels(uint16_t x, uint16_t y, uint16_t size, uint8_t inten
   return err;
 }
 
+const char *animationTypeName(AnimationType type) {
+  switch (type) {
+    case ANIMATION_CHECKER: return "CHECKER";
+    case ANIMATION_BARS: return "BARS";
+    case ANIMATION_GRADIENT: return "GRADIENT";
+    case ANIMATION_SQUARE: return "SQUARE";
+    default: return "STOPPED";
+  }
+}
+
+esp_err_t writeAnimationFrame() {
+  if (rowBuffer == nullptr) return ESP_ERR_NO_MEM;
+
+  const int32_t phase = static_cast<int32_t>(animation.frame) * animation.speed;
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t y = 0; y < DISPLAY_HEIGHT; ++y) {
+    for (uint16_t x = 0; x < DISPLAY_WIDTH; ++x) {
+      uint8_t pixel = 0;
+      switch (animation.type) {
+        case ANIMATION_CHECKER: {
+          const uint16_t block = animation.size == 0 ? 1 : animation.size;
+          int32_t shifted = (static_cast<int32_t>(x) + phase) % (2 * block);
+          if (shifted < 0) shifted += 2 * block;
+          pixel = (((shifted / block) + (y / block)) & 1) ? 0 : animation.intensity;
+          break;
+        }
+        case ANIMATION_BARS: {
+          const uint16_t width = animation.size == 0 ? 1 : animation.size;
+          int32_t shifted = (static_cast<int32_t>(x) + phase) % (2 * width);
+          if (shifted < 0) shifted += 2 * width;
+          pixel = shifted < width ? animation.intensity : 0;
+          break;
+        }
+        case ANIMATION_GRADIENT:
+          pixel = static_cast<uint8_t>((x + y + phase) & 0xFF);
+          break;
+        case ANIMATION_SQUARE: {
+          const uint16_t side = animation.size < DISPLAY_HEIGHT ? animation.size : DISPLAY_HEIGHT;
+          const int32_t travel = DISPLAY_WIDTH > side ? DISPLAY_WIDTH - side : 1;
+          int32_t left = phase % (2 * travel);
+          if (left < 0) left += 2 * travel;
+          if (left > travel) left = 2 * travel - left;
+          const uint16_t top = (DISPLAY_HEIGHT - side) / 2;
+          pixel = (x >= left && x < left + side && y >= top && y < top + side)
+                    ? animation.intensity : 0;
+          break;
+        }
+        default:
+          pixel = 0;
+      }
+      rowBuffer[x] = pixel;
+    }
+
+    err = y == 0
+      ? beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, displayMode)
+      : transferDataChunk(rowBuffer, DISPLAY_WIDTH, displayMode);
+    if (err != ESP_OK) break;
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+void serviceAnimation() {
+  if (animation.type == ANIMATION_STOPPED) return;
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(now - animation.nextFrameAt) < 0) return;
+
+  const uint32_t scheduledAt = animation.nextFrameAt;
+  esp_err_t err = writeAnimationFrame();
+  if (err != ESP_OK) {
+    animation.type = ANIMATION_STOPPED;
+    printEspError("animation", err);
+    return;
+  }
+
+  animation.frame++;
+  const uint32_t interval = 1000UL / (animation.fps == 0 ? 1 : animation.fps);
+  animation.nextFrameAt = scheduledAt + interval;
+  const uint32_t finishedAt = millis();
+  if (static_cast<int32_t>(finishedAt - animation.nextFrameAt) >= 0) {
+    // Do not build an ever-growing backlog when the requested FPS exceeds the
+    // measured panel throughput. Render the next frame as soon as possible.
+    animation.nextFrameAt = finishedAt;
+  }
+}
+
 void setup() {
   Serial.begin(115200);
 
@@ -333,13 +442,48 @@ void setup() {
 }
 
 void loop() {
+  serviceAnimation();
   if (Serial.available() > 0) {
     String input = Serial.readStringUntil('\n');
     input.trim();
     if (input.length() == 0) return;
 
     char cmd = input.charAt(0);
-    if (cmd == 'X' || cmd == 'x') {
+    if (cmd == 'A' || cmd == 'a') {
+      char typeToken[16] = {};
+      unsigned int fps = 10, size = 32, intensity = 255;
+      int speed = 4;
+      int parsed = sscanf(input.c_str() + 1, "%15s %u %u %u %d", typeToken, &fps, &size, &intensity, &speed);
+
+      if (parsed < 1) {
+        Serial.printf("%s %u %u %u %d %lu\n", animationTypeName(animation.type), animation.fps,
+                      animation.size, animation.intensity, animation.speed,
+                      static_cast<unsigned long>(animation.frame));
+      } else if (strcasecmp(typeToken, "STOP") == 0) {
+        animation.type = ANIMATION_STOPPED;
+        Serial.println("OK");
+      } else {
+        AnimationType requested = ANIMATION_STOPPED;
+        if (strcasecmp(typeToken, "CHECKER") == 0) requested = ANIMATION_CHECKER;
+        else if (strcasecmp(typeToken, "BARS") == 0) requested = ANIMATION_BARS;
+        else if (strcasecmp(typeToken, "GRADIENT") == 0) requested = ANIMATION_GRADIENT;
+        else if (strcasecmp(typeToken, "SQUARE") == 0) requested = ANIMATION_SQUARE;
+
+        if (requested == ANIMATION_STOPPED || fps < 1 || fps > 120 || size < 1 ||
+            size > DISPLAY_WIDTH || intensity > 255) {
+          Serial.println("ERR animation arguments");
+        } else {
+          animation.type = requested;
+          animation.fps = static_cast<uint16_t>(fps);
+          animation.size = static_cast<uint16_t>(size);
+          animation.intensity = static_cast<uint8_t>(intensity);
+          animation.speed = static_cast<int16_t>(speed);
+          animation.frame = 0;
+          animation.nextFrameAt = millis();
+          Serial.println("OK");
+        }
+      }
+    } else if (cmd == 'X' || cmd == 'x') {
       digitalWrite(PIN_NUM_RST, LOW);
       delay(5);
       digitalWrite(PIN_NUM_RST, HIGH);
