@@ -153,8 +153,12 @@ class AnimationController:
             animation, fps, size, intensity, speed = self.settings()
             self.frame = int((time.monotonic() - self.started_at) * fps)
             pixels = self.render_preview(animation, size, intensity, speed, self.frame)
-            pgm = f"P5\n{PREVIEW_WIDTH} {PREVIEW_HEIGHT}\n255\n".encode("ascii") + pixels
-            self.preview_image = tk.PhotoImage(data=pgm, format="PGM")
+            rgb_pixels = bytearray(len(pixels) * 3)
+            rgb_pixels[0::3] = pixels
+            rgb_pixels[1::3] = pixels
+            rgb_pixels[2::3] = pixels
+            ppm = f"P6\n{PREVIEW_WIDTH} {PREVIEW_HEIGHT}\n255\n".encode("ascii") + rgb_pixels
+            self.preview_image = tk.PhotoImage(data=ppm, format="PPM")
             if self.preview_item is None:
                 self.preview_item = self.canvas.create_image(0, 0, image=self.preview_image, anchor="nw")
             else:

@@ -42,7 +42,7 @@
 #define DISPLAY_HEIGHT 480
 
 #define PANEL_SPI_HOST VSPI_HOST
-#define SPI_FREQUENCY 10e6
+#define SPI_FREQUENCY 40e6
 
 static const uint8_t DISPLAY_FORMAT_GRAY256 = 0x9A;
 static spi_device_handle_t displaySpi = nullptr;
