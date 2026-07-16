@@ -18,6 +18,11 @@ PREVIEW_SCALE = 2
 PREVIEW_WIDTH = PANEL_WIDTH // PREVIEW_SCALE
 PREVIEW_HEIGHT = PANEL_HEIGHT // PREVIEW_SCALE
 PREVIEW_FPS = 15
+PREVIEW_VISIBLE_MIN = 48
+PREVIEW_BRIGHTNESS_LUT = bytes(
+    0 if value == 0 else PREVIEW_VISIBLE_MIN + (value * (255 - PREVIEW_VISIBLE_MIN) // 255)
+    for value in range(256)
+)
 BAUD_RATE = 115200
 
 
@@ -194,6 +199,7 @@ class AnimationController:
                 # animation frame. Avoid recreating an identical Tk image.
                 if self.frame != self.preview_rendered_frame or settings != self.preview_rendered_settings:
                     pixels = self.render_preview(animation, size, intensity, speed, self.frame)
+                    pixels = pixels.translate(PREVIEW_BRIGHTNESS_LUT)
                     rgb_pixels = bytearray(len(pixels) * 3)
                     rgb_pixels[0::3] = pixels
                     rgb_pixels[1::3] = pixels
