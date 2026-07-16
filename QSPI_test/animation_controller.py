@@ -1,6 +1,5 @@
 """Live controller and computer-side preview for the DMHSM animation engine."""
 
-import base64
 import threading
 import time
 import tkinter as tk
@@ -201,11 +200,9 @@ class AnimationController:
                     rgb_pixels[2::3] = pixels
                     ppm = f"P6\n{PREVIEW_WIDTH} {PREVIEW_HEIGHT}\n255\n".encode("ascii") + rgb_pixels
 
-                    # Passing raw binary through Tcl/Tk can intermittently
-                    # corrupt the macOS Tk 9 renderer. Base64 keeps the Tcl
-                    # boundary text-safe while PhotoImage still decodes PPM.
-                    image_data = base64.b64encode(ppm)
-                    next_image = tk.PhotoImage(data=image_data, format="PPM")
+                    # Tk 9 accepts PPM as raw bytes but no longer recognizes
+                    # the base64 representation supported by some Tk builds.
+                    next_image = tk.PhotoImage(data=ppm, format="PPM")
                     if self.preview_item is None:
                         self.preview_item = self.canvas.create_image(0, 0, image=next_image, anchor="nw")
                     else:
