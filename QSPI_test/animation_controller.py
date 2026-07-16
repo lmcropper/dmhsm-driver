@@ -1,5 +1,6 @@
 """Live controller and computer-side preview for the DMHSM animation engine."""
 
+import base64
 import threading
 import time
 import tkinter as tk
@@ -17,6 +18,7 @@ PANEL_HEIGHT = 480
 PREVIEW_SCALE = 2
 PREVIEW_WIDTH = PANEL_WIDTH // PREVIEW_SCALE
 PREVIEW_HEIGHT = PANEL_HEIGHT // PREVIEW_SCALE
+PREVIEW_FPS = 15
 BAUD_RATE = 115200
 
 
@@ -31,6 +33,8 @@ class AnimationController:
         self.started_at = time.monotonic()
         self.preview_image = None
         self.preview_item = None
+        self.preview_rendered_frame = None
+        self.preview_rendered_settings = None
 
         self.port_var = tk.StringVar()
         self.animation_var = tk.StringVar(value="CHECKER")
@@ -125,6 +129,8 @@ class AnimationController:
         self.running = True
         self.frame = 0
         self.started_at = time.monotonic()
+        self.preview_rendered_frame = None
+        self.preview_rendered_settings = None
         self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed}")
 
     def stop(self):
@@ -149,21 +155,39 @@ class AnimationController:
         threading.Thread(target=worker, daemon=True).start()
 
     def preview_tick(self):
-        if self.running:
-            animation, fps, size, intensity, speed = self.settings()
-            self.frame = int((time.monotonic() - self.started_at) * fps)
-            pixels = self.render_preview(animation, size, intensity, speed, self.frame)
-            rgb_pixels = bytearray(len(pixels) * 3)
-            rgb_pixels[0::3] = pixels
-            rgb_pixels[1::3] = pixels
-            rgb_pixels[2::3] = pixels
-            ppm = f"P6\n{PREVIEW_WIDTH} {PREVIEW_HEIGHT}\n255\n".encode("ascii") + rgb_pixels
-            self.preview_image = tk.PhotoImage(data=ppm, format="PPM")
-            if self.preview_item is None:
-                self.preview_item = self.canvas.create_image(0, 0, image=self.preview_image, anchor="nw")
-            else:
-                self.canvas.itemconfigure(self.preview_item, image=self.preview_image)
-        self.root.after(33, self.preview_tick)
+        try:
+            if self.running:
+                animation, fps, size, intensity, speed = self.settings()
+                self.frame = int((time.monotonic() - self.started_at) * fps)
+                settings = (animation, size, intensity, speed)
+
+                # A low hardware FPS can map several preview ticks to the same
+                # animation frame. Avoid recreating an identical Tk image.
+                if self.frame != self.preview_rendered_frame or settings != self.preview_rendered_settings:
+                    pixels = self.render_preview(animation, size, intensity, speed, self.frame)
+                    rgb_pixels = bytearray(len(pixels) * 3)
+                    rgb_pixels[0::3] = pixels
+                    rgb_pixels[1::3] = pixels
+                    rgb_pixels[2::3] = pixels
+                    ppm = f"P6\n{PREVIEW_WIDTH} {PREVIEW_HEIGHT}\n255\n".encode("ascii") + rgb_pixels
+
+                    # Passing raw binary through Tcl/Tk can intermittently
+                    # corrupt the macOS Tk 9 renderer. Base64 keeps the Tcl
+                    # boundary text-safe while PhotoImage still decodes PPM.
+                    image_data = base64.b64encode(ppm)
+                    next_image = tk.PhotoImage(data=image_data, format="PPM")
+                    if self.preview_item is None:
+                        self.preview_item = self.canvas.create_image(0, 0, image=next_image, anchor="nw")
+                    else:
+                        self.canvas.itemconfigure(self.preview_item, image=next_image)
+                    self.preview_image = next_image
+                    self.preview_rendered_frame = self.frame
+                    self.preview_rendered_settings = settings
+        except (tk.TclError, ValueError) as exc:
+            self.running = False
+            self.status_var.set(f"Preview stopped after a rendering error: {exc}")
+        finally:
+            self.root.after(1000 // PREVIEW_FPS, self.preview_tick)
 
     @staticmethod
     def render_preview(animation, size, intensity, speed, frame):
