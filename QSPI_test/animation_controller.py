@@ -46,6 +46,7 @@ class AnimationController:
         self.size_var = tk.StringVar(value="32")
         self.intensity_var = tk.StringVar(value="1")
         self.speed_var = tk.StringVar(value="4")
+        self.vertical_var = tk.BooleanVar(value=False)
         self.committed = {"fps": 10, "size": 32, "intensity": 1, "speed": 4}
         self.status_var = tk.StringVar(value="Preview ready; hardware disconnected")
 
@@ -83,8 +84,18 @@ class AnimationController:
             widget.bind("<Return>", lambda _event, n=name: self.commit_field(n))
             self.add_field(controls, row, label, widget)
 
-        ttk.Button(controls, text="Play", command=self.play).grid(row=9, column=0, sticky="ew", pady=(12, 0))
-        ttk.Button(controls, text="Stop", command=self.stop).grid(row=9, column=1, sticky="ew", pady=(12, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Scroll vertically",
+            variable=self.vertical_var,
+            command=self.direction_changed,
+        ).grid(row=9, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        ttk.Button(controls, text="Play", command=self.play).grid(row=10, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(controls, text="Stop", command=self.stop).grid(row=10, column=1, sticky="ew", pady=(12, 0))
+        ttk.Button(controls, text="Hardware Reset", command=self.trigger_reset).grid(
+            row=11, column=0, columnspan=2, sticky="ew", pady=(8, 0)
+        )
 
         preview = ttk.LabelFrame(self.root, text="Expected microLED output", padding=8)
         preview.grid(row=0, column=1, padx=(0, 10), pady=10)
@@ -130,7 +141,16 @@ class AnimationController:
 
     def settings(self):
         return (self.animation_var.get(), self.committed["fps"], self.committed["size"],
-                self.committed["intensity"], self.committed["speed"])
+                self.committed["intensity"], self.committed["speed"],
+                "V" if self.vertical_var.get() else "H")
+
+    def direction_changed(self):
+        self.preview_rendered_settings = None
+        if self.running:
+            self.frame = 0
+            self.started_at = time.monotonic()
+            animation, fps, size, intensity, speed, direction = self.settings()
+            self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed} {direction}")
 
     def commit_field(self, name, apply_running=True):
         variable = getattr(self, f"{name}_var") if name != "intensity" else self.intensity_var
@@ -149,8 +169,8 @@ class AnimationController:
         if self.running and apply_running:
             self.frame = 0
             self.started_at = time.monotonic()
-            animation, fps, size, intensity, speed = self.settings()
-            self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed}")
+            animation, fps, size, intensity, speed, direction = self.settings()
+            self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed} {direction}")
         return "break"
 
     def commit_all_fields(self):
@@ -159,17 +179,20 @@ class AnimationController:
 
     def play(self):
         self.commit_all_fields()
-        animation, fps, size, intensity, speed = self.settings()
+        animation, fps, size, intensity, speed, direction = self.settings()
         self.running = True
         self.frame = 0
         self.started_at = time.monotonic()
         self.preview_rendered_frame = None
         self.preview_rendered_settings = None
-        self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed}")
+        self.send_command_async(f"A {animation} {fps} {size} {intensity} {speed} {direction}")
 
     def stop(self):
         self.running = False
         self.send_command_async("A STOP")
+
+    def trigger_reset(self):
+        self.send_command_async("X")
 
     def send_command_async(self, command):
         if not self.serial_port or not self.serial_port.is_open:
@@ -191,14 +214,14 @@ class AnimationController:
     def preview_tick(self):
         try:
             if self.running:
-                animation, fps, size, intensity, speed = self.settings()
+                animation, fps, size, intensity, speed, direction = self.settings()
                 self.frame = int((time.monotonic() - self.started_at) * fps)
-                settings = (animation, size, intensity, speed)
+                settings = (animation, size, intensity, speed, direction)
 
                 # A low hardware FPS can map several preview ticks to the same
                 # animation frame. Avoid recreating an identical Tk image.
                 if self.frame != self.preview_rendered_frame or settings != self.preview_rendered_settings:
-                    pixels = self.render_preview(animation, size, intensity, speed, self.frame)
+                    pixels = self.render_preview(animation, size, intensity, speed, direction, self.frame)
                     pixels = pixels.translate(PREVIEW_BRIGHTNESS_LUT)
                     rgb_pixels = bytearray(len(pixels) * 3)
                     rgb_pixels[0::3] = pixels
@@ -223,25 +246,28 @@ class AnimationController:
             self.root.after(1000 // PREVIEW_FPS, self.preview_tick)
 
     @staticmethod
-    def render_preview(animation, size, intensity, speed, frame):
+    def render_preview(animation, size, intensity, speed, direction, frame):
         output = bytearray(PREVIEW_WIDTH * PREVIEW_HEIGHT)
         phase = frame * speed
-        side = min(size, PANEL_HEIGHT)
-        travel = max(1, PANEL_WIDTH - side)
-        left = phase % (2 * travel)
-        if left > travel:
-            left = 2 * travel - left
-        top = (PANEL_HEIGHT - side) // 2
+        vertical = direction == "V"
+        side = min(size, PANEL_HEIGHT if vertical else min(PANEL_WIDTH, PANEL_HEIGHT))
+        travel = max(1, (PANEL_HEIGHT if vertical else PANEL_WIDTH) - side)
+        position = phase % (2 * travel)
+        if position > travel:
+            position = 2 * travel - position
+        left = (PANEL_WIDTH - side) // 2 if vertical else position
+        top = position if vertical else (PANEL_HEIGHT - side) // 2
 
         index = 0
         for py in range(PREVIEW_HEIGHT):
             y = py * PREVIEW_SCALE
             for px in range(PREVIEW_WIDTH):
                 x = px * PREVIEW_SCALE
+                shifted_axis = (y if vertical else x) + phase
                 if animation == "CHECKER":
-                    value = 0 if (((x + phase) // size + y // size) & 1) else intensity
+                    value = 0 if (((shifted_axis // size) + ((x if vertical else y) // size)) & 1) else intensity
                 elif animation == "BARS":
-                    value = intensity if (x + phase) % (2 * size) < size else 0
+                    value = intensity if shifted_axis % (2 * size) < size else 0
                 elif animation == "GRADIENT":
                     value = (((x + y + phase) & 0xFF) * intensity) // 255
                 elif animation == "SQUARE":
@@ -250,12 +276,14 @@ class AnimationController:
                     scale = max(1, size // 7)
                     word_width = 17 * scale
                     word_height = 7 * scale
-                    jay_travel = max(1, PANEL_WIDTH - word_width)
-                    jay_left = phase % (2 * jay_travel)
-                    if jay_left > jay_travel:
-                        jay_left = 2 * jay_travel - jay_left
+                    jay_travel = max(1, (PANEL_HEIGHT - word_height) if vertical else (PANEL_WIDTH - word_width))
+                    jay_position = phase % (2 * jay_travel)
+                    if jay_position > jay_travel:
+                        jay_position = 2 * jay_travel - jay_position
+                    jay_left = (PANEL_WIDTH - word_width) // 2 if vertical else jay_position
+                    jay_top = jay_position if vertical else (PANEL_HEIGHT - word_height) // 2
                     local_x = x - jay_left
-                    local_y = y - (PANEL_HEIGHT - word_height) // 2
+                    local_y = y - jay_top
                     letter = local_x // (6 * scale) if local_x >= 0 else -1
                     column = (local_x % (6 * scale)) // scale if local_x >= 0 else -1
                     row = local_y // scale if local_y >= 0 else -1

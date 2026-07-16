@@ -33,15 +33,20 @@ The preview works without connecting hardware. After flashing
 mirror Play/Stop commands to the panel. Supported commands are:
 
 ```text
-A CHECKER  <fps> <block-size> <intensity> <speed>
-A BARS     <fps> <bar-width>  <intensity> <speed>
-A GRADIENT <fps> <size>       <intensity> <speed>
-A SQUARE   <fps> <side-length> <intensity> <speed>
-A JAY      <fps> <letter-height> <intensity> <speed>
+A CHECKER  <fps> <block-size> <intensity> <speed> [H|V]
+A BARS     <fps> <bar-width>  <intensity> <speed> [H|V]
+A GRADIENT <fps> <size>       <intensity> <speed> [H|V]
+A SQUARE   <fps> <side-length> <intensity> <speed> [H|V]
+A JAY      <fps> <letter-height> <intensity> <speed> [H|V]
 A STOP
 A
 ```
 
-The final `A` form returns the current animation settings and rendered frame
-counter. The panel QSPI clock is initially raised from 1 MHz to 10 MHz; verify
+The optional direction selects horizontal (`H`, the default) or vertical (`V`)
+scrolling. The controller exposes it as a **Scroll vertically** toggle. The final
+`A` form returns the current animation settings, direction, and rendered frame
+counter. Its **Hardware Reset** button sends the same `X` command as the main
+QSPI controller. When rendering cannot sustain the requested FPS, the firmware
+skips overdue animation frames so panel motion remains synchronized with the
+elapsed-time preview. The panel QSPI clock is initially raised from 1 MHz to 10 MHz; verify
 signal integrity on the target hardware before trying higher rates.
