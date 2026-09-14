@@ -3,6 +3,9 @@ import time
 import tkinter as tk
 from tkinter import scrolledtext, ttk
 
+import json
+from tkinter import filedialog
+
 import serial
 import serial.tools.list_ports
 
@@ -128,9 +131,21 @@ class SPIControllerApp:
         pixel_frame = ttk.LabelFrame(self.root, text="Display Pixel Square")
         pixel_frame.pack(padx=10, pady=5, fill="x")
 
-        self.square_x_entry = self.add_grid_entry(pixel_frame, "X px:", "0", 0, 0)
-        self.square_y_entry = self.add_grid_entry(pixel_frame, "Y px:", "0", 0, 2)
-        self.square_size_entry = self.add_grid_entry(pixel_frame, "N px:", "8", 0, 4)
+        grid_frame = ttk.LabelFrame(self.root, text="Display Grid of Squares")
+        grid_frame.pack(padx=10, pady=5, fill="x")
+        ttk.Button(grid_frame, text="Open Alignment Grid", command=self.open_alignment_grid).grid(row=0, column=7, padx=5, pady=5)
+
+#START GPT
+
+        self.grid_n_entry = self.add_grid_entry(grid_frame, "Grid NxN:", "2", 0, 0)
+        self.grid_size_entry = self.add_grid_entry(grid_frame, "Square Size px:", "1", 0, 2)
+        self.grid_intensity_entry = self.add_grid_entry(grid_frame, "Intensity:", "0xFF", 0, 4, width=10)
+        ttk.Button(grid_frame, text="Draw Grid", command=self.draw_grid).grid(row=0, column=6, padx=5, pady=5)
+#END GPT
+
+        self.square_x_entry = self.add_grid_entry(pixel_frame, "X px:", "320", 0, 0)
+        self.square_y_entry = self.add_grid_entry(pixel_frame, "Y px:", "240", 0, 2)
+        self.square_size_entry = self.add_grid_entry(pixel_frame, "N px:", "1", 0, 4)
         self.square_intensity_entry = self.add_grid_entry(pixel_frame, "Intensity:", "0xFF", 0, 6, width=10)
         ttk.Button(pixel_frame, text="Draw Square", command=self.draw_square).grid(row=0, column=8, padx=5, pady=5)
 
@@ -421,6 +436,30 @@ class SPIControllerApp:
 
         self.run_serial_task("Drawing display square", task)
 
+#START GPT
+    def draw_grid(self):
+        def task():
+            n = self.parse_pixel(self.grid_n_entry.get(), "N", 1, min(DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            size = self.parse_pixel(self.grid_size_entry.get(), "size", 1, max(DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            intensity = self.parse_byte(self.grid_intensity_entry.get(), "intensity")
+            
+            # Geometry Validation: Ensure square fits in perfectly square cell
+            min_dim = min(DISPLAY_WIDTH, DISPLAY_HEIGHT)
+            cell_size = min_dim // n
+            if size > cell_size:
+                raise ValueError(f"Square size ({size}) exceeds perfectly square grid cell limits ({cell_size}x{cell_size})")
+            mode = self.selected_transfer_mode()
+
+            response = self.send_cmd_with_timeout(f"G {n} {size} {intensity} {mode}", FRAME_TIMEOUT_SECONDS)
+            self.expect_ok(response, "grid draw")
+            self.log_from_thread(
+                f"Draw {mode} grid {n}x{n} with square size {size} px "
+                f"-> Intensity Hex: 0x{intensity:02X} | Bin: 0b{intensity:08b}"
+            )
+
+        self.run_serial_task("Drawing display grid", task)
+    #END GPT
+    
     def send_checkerboard(self):
         def task():
             block_size = self.parse_pixel(self.checker_size_entry.get(), "block size", 1, DISPLAY_WIDTH)
@@ -434,6 +473,339 @@ class SPIControllerApp:
             )
 
         self.run_serial_task("Sending checkerboard", task)
+
+    def open_alignment_grid(self):
+        try:
+            n = self.parse_pixel(self.grid_n_entry.get(), "N", 1, min(DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            size = self.parse_pixel(self.grid_size_entry.get(), "size", 1, max(DISPLAY_WIDTH, DISPLAY_HEIGHT))
+            intensity = self.parse_byte(self.grid_intensity_entry.get(), "intensity")
+            mode = self.selected_transfer_mode()
+            
+            # Validation: N*N cannot exceed the ESP32's MAX_POINTS (250)
+            if n * n > 250:
+                raise ValueError(f"An {n}x{n} grid requires {n*n} points, exceeding the 250 hardware limit.")
+                
+            cell_w = DISPLAY_WIDTH // n
+            cell_h = DISPLAY_HEIGHT // n
+            if size > cell_w or size > cell_h:
+                raise ValueError(f"Square size ({size}) exceeds base grid limits ({cell_w}x{cell_h})")
+                
+            AlignmentGridWindow(self, n, size, intensity, mode)
+            
+        except ValueError as exc:
+            self.log(f"Invalid parameters: {exc}")
+class AlignmentGridWindow:
+    def __init__(self, parent_app, n, size, intensity, mode):
+        self.app = parent_app
+        self.n = n
+        self.default_size = size
+        self.intensity = intensity
+        self.mode = mode
+        
+        self.window = tk.Toplevel(parent_app.root)
+        self.window.title(f"Optical Alignment Grid ({n}x{n})")
+        
+        # File IO Toolbar
+        toolbar = ttk.Frame(self.window)
+        toolbar.pack(fill="x", padx=10, pady=5)
+        ttk.Button(toolbar, text="Load Config", command=self.load_config).pack(side="left", padx=5)
+        ttk.Button(toolbar, text="Save Config", command=self.save_config).pack(side="left", padx=5)
+        ttk.Label(toolbar, text="Arrows: Nudge | +/-: Resize | T: Toggle | Space: Push").pack(side="right", padx=5)
+        
+        # Canvas
+        self.canvas = tk.Canvas(self.window, width=DISPLAY_WIDTH, height=DISPLAY_HEIGHT, bg="black")
+        self.canvas.pack(padx=10, pady=5)
+        
+        # Control Panel - Row 1 (Inputs)
+        control_frame = ttk.Frame(self.window)
+        control_frame.pack(fill="x", padx=10, pady=2)
+        
+        ttk.Label(control_frame, text="X:").pack(side="left", padx=2)
+        self.x_var = tk.StringVar()
+        self.x_entry = ttk.Entry(control_frame, textvariable=self.x_var, width=5)
+        self.x_entry.pack(side="left", padx=2)
+        
+        ttk.Label(control_frame, text="Y:").pack(side="left", padx=2)
+        self.y_var = tk.StringVar()
+        self.y_entry = ttk.Entry(control_frame, textvariable=self.y_var, width=5)
+        self.y_entry.pack(side="left", padx=2)
+        
+        ttk.Label(control_frame, text="Size:").pack(side="left", padx=2)
+        self.size_var = tk.StringVar()
+        self.size_entry = ttk.Entry(control_frame, textvariable=self.size_var, width=5)
+        self.size_entry.pack(side="left", padx=2)
+        
+        ttk.Button(control_frame, text="Apply", command=self.apply_manual_inputs).pack(side="left", padx=2)
+        ttk.Button(control_frame, text="Apply Size to All", command=self.apply_size_to_all).pack(side="left", padx=10)
+        ttk.Button(control_frame, text="Toggle On/Off", command=self.toggle_active).pack(side="left", padx=2)
+        
+        # Control Panel - Row 2 (Actions)
+        action_frame = ttk.Frame(self.window)
+        action_frame.pack(fill="x", padx=10, pady=5)
+        ttk.Button(action_frame, text="Push to Display", command=self.send_payload).pack(side="right", padx=2)
+        ttk.Button(action_frame, text="Reset Grid", command=self.reset_grid).pack(side="right", padx=10)
+        
+        self.squares = []
+        self.selected_idx = None
+        
+        self.reset_grid()
+        
+        # Event Bindings
+        self.canvas.bind("<Button-1>", self.on_click)
+        
+        # Movement & Toggles
+        self.window.bind("<Up>", lambda e: self.nudge(0, -1))
+        self.window.bind("<Down>", lambda e: self.nudge(0, 1))
+        self.window.bind("<Left>", lambda e: self.nudge(-1, 0))
+        self.window.bind("<Right>", lambda e: self.nudge(1, 0))
+        self.window.bind("t", self.toggle_active)
+        self.window.bind("T", self.toggle_active)
+        self.window.bind("<space>", self.send_payload)
+        
+        # Resize keys
+        self.window.bind("<plus>", lambda e: self.adjust_size(1))
+        self.window.bind("<equal>", lambda e: self.adjust_size(1))
+        self.window.bind("<minus>", lambda e: self.adjust_size(-1))
+        
+        # Bind enter key in entries to apply
+        self.x_entry.bind("<Return>", self.apply_manual_inputs)
+        self.y_entry.bind("<Return>", self.apply_manual_inputs)
+        self.size_entry.bind("<Return>", self.apply_manual_inputs)
+        
+        self.window.focus_set()
+
+    def update_square_visual(self, idx):
+        """Helper to consistently style squares based on selection and active state."""
+        sq = self.squares[idx]
+        
+        # If disabled, make it hollow so the user knows it won't render
+        is_active = sq.get('active', True)
+        fill_color = f"#{self.intensity:02X}{self.intensity:02X}{self.intensity:02X}" if is_active else ""
+        
+        outline_color = "red" if idx == self.selected_idx else ("gray" if is_active else "#444444")
+        line_width = 2 if idx == self.selected_idx else 1
+        
+        self.canvas.itemconfig(sq['id'], fill=fill_color, outline=outline_color, width=line_width)
+        self.canvas.coords(sq['id'], sq['x'], sq['y'], sq['x'] + sq['size'], sq['y'] + sq['size'])
+
+    def reset_grid(self):
+        self.canvas.delete("all")
+        self.squares.clear()
+        self.selected_idx = None
+        self.x_var.set("")
+        self.y_var.set("")
+        self.size_var.set("")
+        
+        cell_w = DISPLAY_WIDTH // self.n
+        cell_h = DISPLAY_HEIGHT // self.n
+        pad_x = (cell_w - self.default_size) // 2
+        pad_y = (cell_h - self.default_size) // 2
+        
+        for row in range(self.n):
+            for col in range(self.n):
+                x = col * cell_w + pad_x
+                y = row * cell_h + pad_y
+                rect_id = self.canvas.create_rectangle(0, 0, 0, 0) # Coords set by visual updater
+                self.squares.append({'id': rect_id, 'x': x, 'y': y, 'size': self.default_size, 'active': True})
+                self.update_square_visual(len(self.squares) - 1)
+
+    def on_click(self, event):
+        prev_idx = self.selected_idx
+        
+        # Find which square was clicked (manual coordinate check so hollow squares are still clickable)
+        clicked_idx = None
+        for idx, sq in enumerate(self.squares):
+            if sq['x'] <= event.x <= sq['x'] + sq['size'] and sq['y'] <= event.y <= sq['y'] + sq['size']:
+                clicked_idx = idx
+                break
+                
+        if clicked_idx is not None:
+            self.selected_idx = clicked_idx
+            if prev_idx is not None and prev_idx != clicked_idx:
+                self.update_square_visual(prev_idx) # Deselect previous
+                
+            self.update_square_visual(self.selected_idx)
+            
+            sq = self.squares[self.selected_idx]
+            self.x_var.set(str(sq['x']))
+            self.y_var.set(str(sq['y']))
+            self.size_var.set(str(sq['size']))
+            self.window.focus_set() 
+
+    def toggle_active(self, event=None):
+        if self.selected_idx is None: return
+        sq = self.squares[self.selected_idx]
+        sq['active'] = not sq.get('active', True)
+        self.update_square_visual(self.selected_idx)
+
+    def apply_manual_inputs(self, event=None):
+        if self.selected_idx is None: return
+        try:
+            new_x = int(self.x_var.get())
+            new_y = int(self.y_var.get())
+            new_size = int(self.size_var.get())
+            
+            new_size = max(1, min(DISPLAY_WIDTH, DISPLAY_HEIGHT, new_size))
+            new_x = max(0, min(DISPLAY_WIDTH - new_size, new_x))
+            new_y = max(0, min(DISPLAY_HEIGHT - new_size, new_y))
+            
+            sq = self.squares[self.selected_idx]
+            sq['x'] = new_x
+            sq['y'] = new_y
+            sq['size'] = new_size
+            
+            self.update_square_visual(self.selected_idx)
+            
+            self.x_var.set(str(new_x))
+            self.y_var.set(str(new_y))
+            self.size_var.set(str(new_size))
+            self.window.focus_set()
+        except ValueError:
+            pass 
+
+    def apply_size_to_all(self):
+        try:
+            new_size = int(self.size_var.get())
+            new_size = max(1, min(DISPLAY_WIDTH, DISPLAY_HEIGHT, new_size))
+            
+            for idx, sq in enumerate(self.squares):
+                # Calculate current center point
+                cx = sq['x'] + (sq['size'] // 2)
+                cy = sq['y'] + (sq['size'] // 2)
+                
+                # Shift top-left corner to keep the center in the same place
+                new_x = cx - (new_size // 2)
+                new_y = cy - (new_size // 2)
+                
+                # Enforce hardware boundaries
+                sq['x'] = max(0, min(DISPLAY_WIDTH - new_size, new_x))
+                sq['y'] = max(0, min(DISPLAY_HEIGHT - new_size, new_y))
+                sq['size'] = new_size
+                
+                self.update_square_visual(idx)
+                
+            # If a square is currently selected, update the manual entry boxes
+            if self.selected_idx is not None:
+                self.x_var.set(str(self.squares[self.selected_idx]['x']))
+                self.y_var.set(str(self.squares[self.selected_idx]['y']))
+                
+            self.size_var.set(str(new_size))
+            self.window.focus_set()
+        except ValueError:
+            pass
+
+    def adjust_size(self, d_size):
+        if self.selected_idx is None: return
+        sq = self.squares[self.selected_idx]
+        
+        new_size = sq['size'] + d_size
+        new_size = max(1, min(DISPLAY_WIDTH, DISPLAY_HEIGHT, new_size))
+        
+        if new_size == sq['size']: return # Hit min/max limit
+        
+        # Calculate current center point
+        cx = sq['x'] + (sq['size'] // 2)
+        cy = sq['y'] + (sq['size'] // 2)
+        
+        # Shift top-left corner to keep the center in the same place
+        new_x = cx - (new_size // 2)
+        new_y = cy - (new_size // 2)
+        
+        # Enforce hardware boundaries
+        sq['x'] = max(0, min(DISPLAY_WIDTH - new_size, new_x))
+        sq['y'] = max(0, min(DISPLAY_HEIGHT - new_size, new_y))
+        sq['size'] = new_size
+        
+        self.update_square_visual(self.selected_idx)
+        self.size_var.set(str(new_size))
+        self.x_var.set(str(sq['x']))
+        self.y_var.set(str(sq['y']))
+
+    def nudge(self, dx, dy):
+        if self.selected_idx is None: return
+        sq = self.squares[self.selected_idx]
+        
+        sq['x'] = max(0, min(DISPLAY_WIDTH - sq['size'], sq['x'] + dx))
+        sq['y'] = max(0, min(DISPLAY_HEIGHT - sq['size'], sq['y'] + dy))
+        
+        self.update_square_visual(self.selected_idx)
+        self.x_var.set(str(sq['x']))
+        self.y_var.set(str(sq['y']))
+
+    def adjust_size(self, d_size):
+        if self.selected_idx is None: return
+        sq = self.squares[self.selected_idx]
+        
+        new_size = max(1, min(DISPLAY_WIDTH - sq['x'], DISPLAY_HEIGHT - sq['y'], sq['size'] + d_size))
+        sq['size'] = new_size
+        
+        self.update_square_visual(self.selected_idx)
+        self.size_var.set(str(new_size))
+
+    def save_config(self):
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".json", filetypes=[("JSON Files", "*.json")], title="Save Alignment Configuration"
+        )
+        if not filepath: return
+        
+        data = {
+            "n": self.n,
+            "intensity": self.intensity,
+            "coordinates": [{"x": sq['x'], "y": sq['y'], "size": sq['size'], "active": sq.get('active', True)} for sq in self.squares]
+        }
+        try:
+            with open(filepath, 'w') as f: json.dump(data, f, indent=4)
+            self.app.log(f"Saved alignment config to {filepath}")
+        except Exception as e:
+            self.app.log(f"Failed to save config: {e}")
+
+    def load_config(self):
+        filepath = filedialog.askopenfilename(
+            filetypes=[("JSON Files", "*.json")], title="Load Alignment Configuration"
+        )
+        if not filepath: return
+        
+        try:
+            with open(filepath, 'r') as f: data = json.load(f)
+            self.n = data.get("n", self.n)
+            self.intensity = data.get("intensity", self.intensity)
+            
+            self.canvas.delete("all")
+            self.squares.clear()
+            self.selected_idx = None
+            self.x_var.set("")
+            self.y_var.set("")
+            self.size_var.set("")
+            
+            for pt in data.get("coordinates", []):
+                rect_id = self.canvas.create_rectangle(0,0,0,0)
+                self.squares.append({
+                    'id': rect_id, 'x': pt['x'], 'y': pt['y'], 
+                    'size': pt.get('size', self.default_size), 'active': pt.get('active', True)
+                })
+                self.update_square_visual(len(self.squares) - 1)
+                
+            self.app.log(f"Loaded alignment config: {filepath}")
+            self.window.title(f"Optical Alignment Grid ({self.n}x{self.n}) - Loaded")
+        except Exception as e:
+            self.app.log(f"Failed to load config: {e}")
+
+    def send_payload(self, event=None):
+        def task():
+            self.app.expect_ok(self.app.send_cmd_with_timeout("C"), "clear list")
+            
+            # Filter out inactive squares before sending
+            active_squares = [sq for sq in self.squares if sq.get('active', True)]
+            
+            for sq in active_squares:
+                cmd = f"P {sq['x']} {sq['y']} {sq['size']} {self.intensity:X}"
+                self.app.expect_ok(self.app.send_cmd_with_timeout(cmd), f"place point {sq['x']},{sq['y']}")
+                
+            response = self.app.send_cmd_with_timeout(f"D {self.mode}", FRAME_TIMEOUT_SECONDS)
+            self.app.expect_ok(response, "draw frame")
+            self.app.log_from_thread(f"Pushed {len(active_squares)} active squares to display.")
+            
+        self.app.run_serial_task("Pushing alignment grid", task)
 
 
 if __name__ == "__main__":

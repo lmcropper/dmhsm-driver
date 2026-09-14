@@ -44,6 +44,16 @@
 #define PANEL_SPI_HOST VSPI_HOST
 #define SPI_FREQUENCY 1e6
 
+#define MAX_POINTS 250
+
+struct DisplayPoint {
+  uint16_t x, y, size;
+  uint8_t intensity;
+};
+
+static DisplayPoint pointList[MAX_POINTS];
+static uint16_t pointCount = 0;
+
 static const uint8_t DISPLAY_FORMAT_GRAY256 = 0x9A;
 static spi_device_handle_t displaySpi = nullptr;
 static uint8_t *rowBuffer = nullptr;
@@ -314,6 +324,163 @@ esp_err_t writeSquarePixels(uint16_t x, uint16_t y, uint16_t size, uint8_t inten
   return err;
 }
 
+//START GPT
+esp_err_t writeGridSquares(uint16_t n, uint16_t size, uint8_t intensity, DisplayTransferMode mode) {
+  if (n == 0 || size == 0) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // Constrain cell size to the smallest display dimension
+  uint16_t min_dim = (DISPLAY_WIDTH < DISPLAY_HEIGHT) ? DISPLAY_WIDTH : DISPLAY_HEIGHT;
+  uint16_t cell_size = min_dim / n;
+
+  if (size > cell_size) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // Calculate total grid footprint and centering offsets
+  uint16_t grid_pixel_span = cell_size * n;
+  uint16_t offset_x = (DISPLAY_WIDTH - grid_pixel_span) / 2;
+  uint16_t offset_y = (DISPLAY_HEIGHT - grid_pixel_span) / 2;
+  uint16_t pad = (cell_size - size) / 2;
+
+  if (rowBuffer == nullptr) {
+    return ESP_ERR_NO_MEM;
+  }
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t row = 0; row < DISPLAY_HEIGHT; ++row) {
+    // Check if the current row falls within the centered 480x480 footprint
+    bool in_grid_y = (row >= offset_y) && (row < offset_y + grid_pixel_span);
+    uint16_t cell_offset_y = in_grid_y ? (row - offset_y) % cell_size : 0;
+    bool in_y = in_grid_y && (cell_offset_y >= pad) && (cell_offset_y < pad + size);
+    
+    for (uint16_t col = 0; col < DISPLAY_WIDTH; ++col) {
+      uint8_t pixel = 0x00;
+      
+      if (in_y) {
+        // Check if the current column falls within the centered 480x480 footprint
+        bool in_grid_x = (col >= offset_x) && (col < offset_x + grid_pixel_span);
+        if (in_grid_x) {
+          uint16_t cell_offset_x = (col - offset_x) % cell_size;
+          if (cell_offset_x >= pad && cell_offset_x < pad + size) {
+            pixel = intensity;
+          }
+        }
+      }
+      rowBuffer[col] = pixel;
+    }
+
+    if (row == 0) {
+      err = beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, mode);
+    } else {
+      err = transferDataChunk(rowBuffer, DISPLAY_WIDTH, mode);
+    }
+
+    if (err != ESP_OK) {
+      break;
+    }
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+esp_err_t writeAddressableGrid(uint16_t n, uint16_t size, uint8_t intensity, const uint8_t* bitmask, DisplayTransferMode mode) {
+  if (n == 0 || size == 0 || bitmask == nullptr || rowBuffer == nullptr) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  uint16_t cell_w = DISPLAY_WIDTH / n;
+  uint16_t cell_h = DISPLAY_HEIGHT / n;
+  
+  if (size > cell_w || size > cell_h) return ESP_ERR_INVALID_ARG;
+
+  uint16_t pad_x = (cell_w - size) / 2;
+  uint16_t pad_y = (cell_h - size) / 2;
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t row = 0; row < DISPLAY_HEIGHT; ++row) {
+    uint16_t grid_y = row / cell_h;
+    uint16_t offset_y = row % cell_h;
+    bool in_y_bounds = (offset_y >= pad_y) && (offset_y < pad_y + size) && (grid_y < n);
+    
+    for (uint16_t col = 0; col < DISPLAY_WIDTH; ++col) {
+      uint8_t pixel = 0x00;
+      
+      if (in_y_bounds) {
+        uint16_t grid_x = col / cell_w;
+        uint16_t offset_x = col % cell_w;
+        
+        if (offset_x >= pad_x && offset_x < pad_x + size && grid_x < n) {
+          // Calculate which bit in the bitmask corresponds to this cell
+          uint16_t bit_index = (grid_y * n) + grid_x;
+          uint16_t byte_index = bit_index / 8;
+          uint8_t bit_offset = bit_index % 8;
+          
+          // If the bit is 1, apply intensity
+          if (bitmask[byte_index] & (1 << bit_offset)) {
+            pixel = intensity;
+          }
+        }
+      }
+      rowBuffer[col] = pixel;
+    }
+
+    if (row == 0) {
+      err = beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, mode);
+    } else {
+      err = transferDataChunk(rowBuffer, DISPLAY_WIDTH, mode);
+    }
+
+    if (err != ESP_OK) break;
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
+esp_err_t renderPointList(DisplayTransferMode mode) {
+  if (rowBuffer == nullptr) return ESP_ERR_NO_MEM;
+
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+
+  for (uint16_t row = 0; row < DISPLAY_HEIGHT; ++row) {
+    for (uint16_t col = 0; col < DISPLAY_WIDTH; ++col) {
+      uint8_t pixel = 0x00; // Default black background
+      
+      // Check if the current pixel falls inside any defined point/square
+      for (uint16_t i = 0; i < pointCount; ++i) {
+        if (col >= pointList[i].x && col < (pointList[i].x + pointList[i].size) &&
+            row >= pointList[i].y && row < (pointList[i].y + pointList[i].size)) {
+          pixel = pointList[i].intensity;
+          break; // First matching point dictates intensity (layer order)
+        }
+      }
+      rowBuffer[col] = pixel;
+    }
+
+    if (row == 0) {
+      err = beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, mode);
+    } else {
+      err = transferDataChunk(rowBuffer, DISPLAY_WIDTH, mode);
+    }
+
+    if (err != ESP_OK) break;
+  }
+
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+//END GPT
+
+
+
 void setup() {
   Serial.begin(115200);
 
@@ -462,7 +629,132 @@ void loop() {
       } else {
         Serial.println("ERR");
       }
-    } else {
+    } else if (cmd == 'G' || cmd == 'g') {
+      unsigned int n, size, intensity = 0xFF;
+      char arg3[16] = {};
+      char arg4[16] = {};
+      DisplayTransferMode requestedMode = displayMode;
+      
+      int parsed = sscanf(input.c_str() + 1, "%u %u %15s %15s", &n, &size, arg3, arg4);
+      if (parsed >= 2) {
+        bool argsOk = true;
+        if (parsed >= 3) {
+          if (parseDisplayModeToken(arg3, &requestedMode)) {
+            // Intensity omitted; arg3 selected the transfer mode.
+          } else {
+            argsOk = parseUnsignedToken(arg3, &intensity);
+            argsOk = argsOk && intensity <= 0xFF;
+          }
+        }
+        if (parsed >= 4) {
+          argsOk = argsOk && parseDisplayModeToken(arg4, &requestedMode);
+        }
+
+        if (argsOk) {
+          esp_err_t err = ensureGray256Mode();
+          if (err == ESP_OK) {
+            err = writeGridSquares(static_cast<uint16_t>(n), static_cast<uint16_t>(size), static_cast<uint8_t>(intensity), requestedMode);
+          }
+
+          if (err == ESP_OK) {
+            displayMode = requestedMode;
+            Serial.println("OK");
+          } else {
+            printEspError("writeGridSquares", err);
+          }
+        } else {
+          Serial.println("ERR");
+        }
+      } else {
+        Serial.println("ERR");
+      }
+    } else if (cmd == 'A' || cmd == 'a') {
+      unsigned int n, size, intensity = 0xFF;
+      char hexPayload[1024] = {}; // Supports up to ~64x64 grids
+      char modeArg[16] = {};
+      DisplayTransferMode requestedMode = displayMode;
+      
+      int parsed = sscanf(input.c_str() + 1, "%u %u %x %1023s %15s", &n, &size, &intensity, hexPayload, modeArg);
+      
+      if (parsed >= 4) {
+        if (parsed == 5) parseDisplayModeToken(modeArg, &requestedMode);
+        
+        size_t hexLen = strlen(hexPayload);
+        size_t expectedBytes = ((n * n) + 7) / 8;
+        
+        if (hexLen / 2 >= expectedBytes) {
+          // Allocate temporary bitmask buffer
+          uint8_t* bitmask = (uint8_t*)malloc(expectedBytes);
+          if (bitmask) {
+            // Convert hex string to byte array
+            for (size_t i = 0; i < expectedBytes; i++) {
+              char buf[3] = {hexPayload[2*i], hexPayload[2*i+1], '\0'};
+              bitmask[i] = (uint8_t)strtoul(buf, nullptr, 16);
+            }
+            
+            esp_err_t err = ensureGray256Mode();
+            if (err == ESP_OK) {
+              err = writeAddressableGrid(n, size, intensity, bitmask, requestedMode);
+            }
+            
+            if (err == ESP_OK) {
+              displayMode = requestedMode;
+              Serial.println("OK");
+            } else {
+              printEspError("writeAddressableGrid", err);
+            }
+            free(bitmask);
+          } else {
+            Serial.println("ERR NO_MEM");
+          }
+        } else {
+          Serial.println("ERR PAYLOAD_TOO_SHORT");
+        }
+      } else {
+        Serial.println("ERR INVALID_ARGS");
+      }
+    } else if (cmd == 'C' || cmd == 'c') {
+      pointCount = 0;
+      Serial.println("OK");
+      
+    } else if (cmd == 'P' || cmd == 'p') {
+      unsigned int x, y, size, intensity = 0xFF;
+      if (sscanf(input.c_str() + 1, "%u %u %u %x", &x, &y, &size, &intensity) >= 3) {
+        if (pointCount < MAX_POINTS) {
+          pointList[pointCount].x = x;
+          pointList[pointCount].y = y;
+          pointList[pointCount].size = size;
+          pointList[pointCount].intensity = static_cast<uint8_t>(intensity);
+          pointCount++;
+          Serial.println("OK");
+        } else {
+          Serial.println("ERR LIST_FULL");
+        }
+      } else {
+        Serial.println("ERR INVALID_ARGS");
+      }
+      
+    } else if (cmd == 'D' || cmd == 'd') {
+      char modeArg[16] = {};
+      DisplayTransferMode requestedMode = displayMode;
+      
+      if (sscanf(input.c_str() + 1, "%15s", modeArg) == 1) {
+        parseDisplayModeToken(modeArg, &requestedMode);
+      }
+      
+      esp_err_t err = ensureGray256Mode();
+      if (err == ESP_OK) {
+        err = renderPointList(requestedMode);
+      }
+      
+      if (err == ESP_OK) {
+        displayMode = requestedMode;
+        Serial.println("OK");
+      } else {
+        printEspError("renderPointList", err);
+      }
+  }
+    else {
       Serial.println("ERR");
     }
   }
