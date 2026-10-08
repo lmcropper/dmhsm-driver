@@ -1,52 +1,53 @@
-# dmhsm-driver
-SPI/QSPI μLED drivers designed for DMHSM0012VGNA
+# microLED Driver
 
-## Functionality
+**Double-click `Start.command` to open the app.** Choose an animation and click **Play**. The preview works without hardware.
 
-This repository contains an ESP32 control driver for the **DMHSM0012VGNA** microLED display module over an SPI interface.
+To drive the panel:
+1. Connect the ESP32 by USB.
+2. Flash the firmware once: open Terminal in this folder and run `./Start.command --flash`.
+3. Open the app, choose the ESP32 serial port, click **Connect**, then **Play**.
 
-### Features
-* **Hardware Initialization**: Uses full device sequence including pulling RST pin low. Sets the display into `GRAY256` pattern sequence out-of-the-box.
-* **Register Configuration**: Configures internal options such as the checkerboard dummy self-test and PWM (brightness level 7). The driver handles the proprietary SPI command formats (`0x78` addressing system, etc.) based upon datasheet specs.
-* **Frame Transmissions over SPI**: Initiates buffer stream transfer chunks based upon `0x02` commands for sending full screen data. It allows simulating dummy rendering frames up to internal display memory constraints to update arrays line-by-line natively supporting the 640x480 resolution layout.
+Set animation, FPS, size, brightness (0–255), speed, and scrolling direction in the app. Click Play to apply changes, or press Enter after editing a numeric field. **Advanced register tools** opens the register console, static patterns, and SPI/QSPI controls. It disconnects the animation controller first; close the tools and reconnect to resume animations.
 
-### File Structure
-- `include/DMHSM.h`: C++ Class definition describing SPI constants and display interface bindings.
-- `src/DMHSM.cpp`: Class implementation of all initializations, resets, and pixel buffer transfers.
-- `src/main.cpp`: An example script invoking module instantiation through Arduino standard loop/setup models.
+## Disk of pixels
 
-## Interactive animation prototype
+Use **Disk (filled circle)** in the main app. **Click or drag on the preview** to place the disk center. With the preview focused, **Up/Down** increases/decreases brightness and **Right/Left** increases/decreases diameter. Each key press changes the value by 1; hold **Shift** for steps of 10. Mouse and key changes request updates to the connected panel. The connected preview changes only after firmware confirms a successful full-frame transfer; while an update is pending it retains the previous confirmed image. Pending changes are combined during rapid dragging so the panel receives the latest setting.
 
-`QSPI_test` now contains a first-pass on-device animation engine and a desktop
-preview/controller. The ESP32 renders frames locally, so serial carries only
-small control messages instead of 307,200 bytes per grayscale frame.
+**Show disk** also activates the disk and focuses the preview for arrow keys. **Turn off** clears the screen. Current coordinates, diameter, and brightness are displayed beside the preview. X ranges from 0–639, Y from 0–479, diameter from 1–640 pixels, and brightness from 0–255. The origin is the upper-left; X increases rightward and Y downward. A disk crossing an edge is clipped. Even diameters place the center half a pixel right and down for a symmetric raster.
 
-Run the desktop controller with:
+Reflash with `./Start.command --flash` to enable disk control and confirmed animation frames. Connecting clears the panel and confirms that black frame before displaying it. Connected animations send one frame at a time and update the preview after each acknowledgement; offline previews run independently. Failed transfers show “Panel output unconfirmed”; a timeout disconnects the controller to prevent a late reply from confirming the wrong frame. Firmware acknowledges successful transmission, not optical measurements from the LEDs. Serial protocol: `D <center-x> <center-y> <diameter> <brightness>`; success returns `OK` and stops any animation. Preview brightness is boosted for visibility and is not a calibrated measure of panel luminance. The preview combines each 2×2 panel block so a one-pixel disk remains visible.
 
-```sh
-cd QSPI_test
-python3 animation_controller.py
-```
+## Setup
 
-The preview works without connecting hardware. After flashing
-`QSPI_test/src/main.cpp`, choose the ESP32 serial port and click **Connect** to
-mirror Play/Stop commands to the panel. Supported commands are:
+The launcher uses an installed Python with Tkinter. For hardware connection that Python also needs `pyserial` (`python3 -m pip install pyserial`). Flashing needs PlatformIO (`python3 -m pip install platformio`). Existing local environments are supported. If Tkinter is missing, install a Python distribution with Tk support; on Homebrew use the `python-tk` package matching your Python version.
 
-```text
-A CHECKER  <fps> <block-size> <intensity> <speed> [H|V]
-A BARS     <fps> <bar-width>  <intensity> <speed> [H|V]
-A GRADIENT <fps> <size>       <intensity> <speed> [H|V]
-A SQUARE   <fps> <side-length> <intensity> <speed> [H|V]
-A JAY      <fps> <letter-height> <intensity> <speed> [H|V]
-A STOP
-A
-```
+Build without flashing: `./Start.command --build`. Alternatively, run `pio run -t upload`. If multiple ESP32 boards are connected, specify one with `pio run -t upload --upload-port PORT`.
 
-The optional direction selects horizontal (`H`, the default) or vertical (`V`)
-scrolling. The controller exposes it as a **Scroll vertically** toggle. The final
-`A` form returns the current animation settings, direction, and rendered frame
-counter. Its **Hardware Reset** button sends the same `X` command as the main
-QSPI controller. When rendering cannot sustain the requested FPS, the firmware
-skips overdue animation frames so panel motion remains synchronized with the
-elapsed-time preview. The panel QSPI clock is initially raised from 1 MHz to 10 MHz; verify
-signal integrity on the target hardware before trying higher rates.
+## Wiring
+
+Firmware targets an ESP32 Dev Module and the DMHSM0012VGNA panel.
+
+| Panel signal | ESP32 GPIO |
+|---|---:|
+| SCLK | 18 |
+| IO0 / MOSI | 23 |
+| IO1 / MISO | 19 |
+| IO2 | 22 |
+| IO3 | 21 |
+| CS | 5 |
+| RST | 17 |
+
+Use the datasheet for power, ground, and electrical requirements. The current firmware uses a 40 MHz SPI clock; actual panel operation requires hardware verification.
+
+## Files
+
+Everything needed for daily use is here:
+- `Start.command` — opens the app; also builds or flashes firmware.
+- `controller.py` — animation preview and advanced controls.
+- `src/main.cpp` — the single active firmware.
+- `platformio.ini` — board/build settings.
+- `DMHSM0012VGNA_Datasheet.pdf` — hardware reference.
+
+Previous SPI example, controller files, datasheet text, and research report are preserved in `.archive` (Finder: Command–Shift–Period shows hidden files). The driver retains its existing Git repository and local environments. The archive is local only; previously tracked source files remain recoverable from Git history.
+
+Connected animation protocol: `F <type> <size> <brightness> <speed> <H|V> <frame>` renders one frame, stops autonomous animation, and returns `OK` only after the transfer succeeds.

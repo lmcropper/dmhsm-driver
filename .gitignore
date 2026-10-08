@@ -1,0 +1,8 @@
+.DS_Store
+.archive/
+.pio/
+.pio-core/
+.platformio/
+.venv/
+.gui-venv/
+__pycache__/

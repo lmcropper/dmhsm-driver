@@ -337,6 +337,27 @@ esp_err_t writeSquarePixels(uint16_t x, uint16_t y, uint16_t size, uint8_t inten
   return err;
 }
 
+// Center is a pixel index; even diameters use a half-pixel center offset.
+esp_err_t writeDiskPixels(int cx, int cy, int diameter, uint8_t intensity) {
+  if (rowBuffer == nullptr) return ESP_ERR_NO_MEM;
+  const int offset = diameter % 2 == 0 ? 1 : 0;
+  const int radiusSquared = diameter * diameter;
+  digitalWrite(PIN_NUM_CS, LOW);
+  esp_err_t err = ESP_OK;
+  for (int y = 0; y < DISPLAY_HEIGHT; ++y) {
+    const int dy = 2 * (y - cy) - offset;
+    for (int x = 0; x < DISPLAY_WIDTH; ++x) {
+      const int dx = 2 * (x - cx) - offset;
+      rowBuffer[x] = dx * dx + dy * dy < radiusSquared ? intensity : 0;
+    }
+    err = y == 0 ? beginDisplayData(DISPLAY_WRITE, rowBuffer, DISPLAY_WIDTH, displayMode)
+                 : transferDataChunk(rowBuffer, DISPLAY_WIDTH, displayMode);
+    if (err != ESP_OK) break;
+  }
+  digitalWrite(PIN_NUM_CS, HIGH);
+  return err;
+}
+
 const char *animationTypeName(AnimationType type) {
   switch (type) {
     case ANIMATION_CHECKER: return "CHECKER";
@@ -529,7 +550,53 @@ void loop() {
           Serial.println("OK");
         }
       }
+    } else if (cmd == 'F' || cmd == 'f') {
+      char type[16], direction[4], extra;
+      int size, intensity, speed;
+      unsigned long frame;
+      AnimationType requested = ANIMATION_STOPPED;
+      int parsed = sscanf(input.c_str() + 1, "%15s %d %d %d %3s %lu %c",
+                          type, &size, &intensity, &speed, direction, &frame, &extra);
+      if (parsed >= 1) {
+        if (strcasecmp(type, "CHECKER") == 0) requested = ANIMATION_CHECKER;
+        else if (strcasecmp(type, "BARS") == 0) requested = ANIMATION_BARS;
+        else if (strcasecmp(type, "GRADIENT") == 0) requested = ANIMATION_GRADIENT;
+        else if (strcasecmp(type, "SQUARE") == 0) requested = ANIMATION_SQUARE;
+        else if (strcasecmp(type, "JAY") == 0) requested = ANIMATION_JAY;
+      }
+      if (parsed != 6 || requested == ANIMATION_STOPPED || size < 1 || size > DISPLAY_WIDTH ||
+          intensity < 0 || intensity > 255 || speed < -100 || speed > 100 || frame > 10000000UL ||
+          (strcasecmp(direction, "H") != 0 && strcasecmp(direction, "V") != 0)) {
+        Serial.println("ERR frame arguments");
+      } else {
+        animation.type = requested;
+        animation.size = size;
+        animation.intensity = intensity;
+        animation.speed = speed;
+        animation.vertical = strcasecmp(direction, "V") == 0;
+        animation.frame = frame;
+        esp_err_t err = ensureGray256Mode();
+        if (err == ESP_OK) err = writeAnimationFrame();
+        animation.type = ANIMATION_STOPPED;
+        if (err == ESP_OK) Serial.println("OK");
+        else printEspError("frame", err);
+      }
+    } else if (cmd == 'D' || cmd == 'd') {
+      int x, y, diameter, intensity;
+      char extra;
+      if (sscanf(input.c_str() + 1, "%d %d %d %d %c", &x, &y, &diameter, &intensity, &extra) != 4 ||
+          x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT ||
+          diameter < 1 || diameter > DISPLAY_WIDTH || intensity < 0 || intensity > 255) {
+        Serial.println("ERR disk arguments");
+      } else {
+        animation.type = ANIMATION_STOPPED;
+        esp_err_t err = ensureGray256Mode();
+        if (err == ESP_OK) err = writeDiskPixels(x, y, diameter, static_cast<uint8_t>(intensity));
+        if (err == ESP_OK) Serial.println("OK");
+        else printEspError("writeDiskPixels", err);
+      }
     } else if (cmd == 'X' || cmd == 'x') {
+      animation.type = ANIMATION_STOPPED;
       digitalWrite(PIN_NUM_RST, LOW);
       delay(5);
       digitalWrite(PIN_NUM_RST, HIGH);
